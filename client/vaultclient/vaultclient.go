@@ -16,7 +16,7 @@ type VaultClient interface {
 	Start()
 	Stop()
 	DeriveToken() (string, error)
-	GetConsulACL() (string, error)
+	GetConsulACL(string, string) (*vaultapi.Secret, error)
 	RenewToken(string) <-chan error
 	StopRenewToken(string) error
 	RenewLease(string) <-chan error
@@ -219,8 +219,22 @@ func (c *vaultClient) DeriveToken() (string, error) {
 	return unwrapResp.Auth.ClientToken, nil
 }
 
-func (c *vaultClient) GetConsulACL() (string, error) {
-	return "", nil
+func (c *vaultClient) GetConsulACL(token, vaultPath string) (*vaultapi.Secret, error) {
+	c.logger.Printf("[INFO] GetConsulACL called with token: %s, vaultPath: %s", token, vaultPath)
+	if token == "" {
+		return nil, fmt.Errorf("missing token")
+	}
+	if vaultPath == "" {
+		return nil, fmt.Errorf("missing vault path")
+	}
+
+	client, err := c.getVaultAPIClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create vault API client: %v", err)
+	}
+	client.SetToken(token)
+
+	return client.Logical().Read(vaultPath)
 }
 
 func (c *vaultClient) RenewToken(token string) <-chan error {

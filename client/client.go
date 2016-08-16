@@ -248,10 +248,16 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 	for i := 0; i < num; i++ {
 		tokens[i], err = c.vaultClient.DeriveToken()
 		if err != nil {
-			log.Printf("vaultclient: failed to derive a vault token: %v", err)
+			return nil, fmt.Errorf("failed to derive a vault token: %v", err)
 		}
 		c.vaultClient.RenewToken(tokens[i])
 	}
+
+	secret, err := c.vaultClient.GetConsulACL("123", "consul/creds/readonly")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch consul ACL token: %v", err)
+	}
+	c.logger.Printf("[INFO] Consul ACL secret: %#v\n", secret)
 
 	/*
 		time.Sleep(10 * time.Second)
