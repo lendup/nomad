@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"fmt"
 	"log"
-	"strconv"
 	"sync"
 	"time"
 
@@ -104,8 +103,6 @@ func NewVaultClient(vaultConfig *config.VaultConfig, logger *log.Logger) (*vault
 		return nil, fmt.Errorf("periodic_token not set")
 	}
 
-	log.Printf("vaultConfig.TaskTokenTTL: %s\n", vaultConfig.TaskTokenTTL)
-
 	return &vaultClient{
 		token:        vaultConfig.Token,
 		taskTokenTTL: vaultConfig.TaskTokenTTL,
@@ -138,9 +135,18 @@ func (c *vaultClient) run() {
 		if renewalTime.IsZero() {
 			renewalCh = nil
 		} else {
-			renewalDuration := renewalTime.Sub(time.Now())
-			renewalCh = time.After(renewalDuration)
-			c.logger.Printf("[INFO] setting renewal to %s\n", renewalDuration)
+			now := time.Now()
+			if renewalTime.After(now) {
+				renewalDuration := renewalTime.Sub(time.Now())
+				renewalCh = time.After(renewalDuration)
+			} else {
+				// When there are too many renewals happining
+				// at the same time, renewal of a few items can
+				// get clogged. Fire such items immediately if
+				// they are past their renewal time.
+				renewalCh = time.After(0)
+				c.logger.Printf("[INFO]         already late firing right away")
+			}
 		}
 
 		select {
@@ -231,7 +237,6 @@ func (c *vaultClient) RenewToken(token string) <-chan error {
 }
 
 func (c *vaultClient) renew(req *vaultClientRenewalRequest) error {
-	c.logger.Printf("[INFO] renew called for id: %s", req.id)
 	if req == nil {
 		return fmt.Errorf("nil renewal request")
 	}
@@ -259,12 +264,9 @@ func (c *vaultClient) renew(req *vaultClientRenewalRequest) error {
 		return fmt.Errorf("failed to renew the vault token")
 	}
 
-	leaseDuration, err := vaultduration.ParseDurationSecond(strconv.Itoa(renewResp.Auth.LeaseDuration))
-	if err != nil {
-		return fmt.Errorf("failed to parse the leaseduration:%v", err)
-	}
-
-	next := time.Now().Add(leaseDuration / 2)
+	now := time.Now()
+	duration := time.Duration(renewResp.Auth.LeaseDuration) * time.Second / 2
+	next := now.Add(duration)
 	if c.heap.IsTracked(req.id) {
 		if err := c.heap.Update(req, next); err != nil {
 			return fmt.Errorf("failed to update heap entry. err: %v", err)
