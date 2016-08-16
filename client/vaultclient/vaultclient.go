@@ -41,7 +41,7 @@ type vaultClientRenewalRequest struct {
 }
 
 type vaultClientHeapEntry struct {
-	data  *vaultClientRenewalRequest
+	req   *vaultClientRenewalRequest
 	next  time.Time
 	index int
 }
@@ -51,8 +51,8 @@ type vaultClientHeap struct {
 	heap    vaultDataHeapImp
 }
 
-func (h *vaultClientHeap) IsTracked(id string) bool {
-	_, ok := h.heapMap[id]
+func (c *vaultClient) IsTracked(id string) bool {
+	_, ok := c.heap.heapMap[id]
 	return ok
 }
 
@@ -68,29 +68,39 @@ func (h *vaultClientHeap) Peek() *vaultClientHeapEntry {
 	return h.heap[0]
 }
 
-func (h *vaultClientHeap) Push(vData *vaultClientRenewalRequest, next time.Time) error {
-	if _, ok := h.heapMap[vData.id]; ok {
-		return fmt.Errorf("entry %v already exists", vData.id)
+func (h *vaultClientHeap) Push(req *vaultClientRenewalRequest, next time.Time) error {
+	if _, ok := h.heapMap[req.id]; ok {
+		return fmt.Errorf("entry %v already exists", req.id)
 	}
 
 	heapEntry := &vaultClientHeapEntry{
-		data: vData,
+		req:  req,
 		next: next,
 	}
-	h.heapMap[vData.id] = heapEntry
+	h.heapMap[req.id] = heapEntry
 	heap.Push(&h.heap, heapEntry)
 	return nil
 }
 
-func (h *vaultClientHeap) Update(vData *vaultClientRenewalRequest, next time.Time) error {
-	if entry, ok := h.heapMap[vData.id]; ok {
-		entry.data = vData
+func (h *vaultClientHeap) Update(req *vaultClientRenewalRequest, next time.Time) error {
+	if entry, ok := h.heapMap[req.id]; ok {
+		entry.req = req
 		entry.next = next
 		heap.Fix(&h.heap, entry.index)
 		return nil
 	}
 
-	return fmt.Errorf("heap doesn't contain %v", vData.id)
+	return fmt.Errorf("heap doesn't contain %v", req.id)
+}
+
+func (h *vaultClientHeap) Remove(id string) error {
+	if entry, ok := h.heapMap[id]; ok {
+		heap.Remove(&h.heap, entry.index)
+		delete(h.heapMap, id)
+		return nil
+	}
+
+	return fmt.Errorf("heap doesn't contain entry for %v", id)
 }
 
 type vaultDataHeapImp []*vaultClientHeapEntry
@@ -130,7 +140,7 @@ func (c *vaultClient) Start() {
 
 func (c *vaultClient) run() {
 	var renewalCh <-chan time.Time
-	for {
+	for c.running {
 		renewalReq, renewalTime := c.nextRenewal()
 		if renewalTime.IsZero() {
 			renewalCh = nil
@@ -140,12 +150,7 @@ func (c *vaultClient) run() {
 				renewalDuration := renewalTime.Sub(time.Now())
 				renewalCh = time.After(renewalDuration)
 			} else {
-				// When there are too many renewals happining
-				// at the same time, renewal of a few items can
-				// get clogged. Fire such items immediately if
-				// they are past their renewal time.
 				renewalCh = time.After(0)
-				c.logger.Printf("[INFO]         already late firing right away")
 			}
 		}
 
@@ -164,6 +169,9 @@ func (c *vaultClient) run() {
 }
 
 func (c *vaultClient) Stop() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.running = false
 	close(c.stopCh)
 }
 
@@ -225,18 +233,12 @@ func (c *vaultClient) RenewToken(token string) <-chan error {
 		renewalReq.errCh <- err
 	}
 
-	// Signal an update.
-	if c.running {
-		select {
-		case c.updateCh <- struct{}{}:
-		default:
-		}
-	}
-
 	return renewalReq.errCh
 }
 
 func (c *vaultClient) renew(req *vaultClientRenewalRequest) error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	if req == nil {
 		return fmt.Errorf("nil renewal request")
 	}
@@ -267,15 +269,25 @@ func (c *vaultClient) renew(req *vaultClientRenewalRequest) error {
 	now := time.Now()
 	duration := time.Duration(renewResp.Auth.LeaseDuration) * time.Second / 2
 	next := now.Add(duration)
-	if c.heap.IsTracked(req.id) {
+	if c.IsTracked(req.id) {
 		if err := c.heap.Update(req, next); err != nil {
 			return fmt.Errorf("failed to update heap entry. err: %v", err)
 		}
 	} else {
+		c.logger.Printf("[INFO] added id %q to heap", req.id)
 		if err := c.heap.Push(req, next); err != nil {
 			return fmt.Errorf("failed to push an entry to heap.  err: %v", err)
 		}
+		// Signal an update.
+		if c.running {
+			select {
+			case c.updateCh <- struct{}{}:
+			default:
+			}
+		}
 	}
+
+	c.logger.Printf("[INFO] renewed: %s\n", req.id)
 
 	return nil
 }
@@ -292,7 +304,7 @@ func (c *vaultClient) nextRenewal() (*vaultClientRenewalRequest, time.Time) {
 		return nil, time.Time{}
 	}
 
-	return nextEntry.data, nextEntry.next
+	return nextEntry.req, nextEntry.next
 }
 
 func (c *vaultClient) getVaultAPIClient() (*vaultapi.Client, error) {
@@ -319,7 +331,27 @@ func (c *vaultClient) getVaultAPIClient() (*vaultapi.Client, error) {
 	return c.vaultAPIClient, nil
 }
 
-func (c *vaultClient) StopRenewToken(string) error {
+func (c *vaultClient) StopRenewToken(token string) error {
+	if !c.IsTracked(token) {
+		return nil
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if err := c.heap.Remove(token); err != nil {
+		return fmt.Errorf("failed to remove heap entry: %v", err)
+	}
+	delete(c.heap.heapMap, token)
+
+	// Signal an update.
+	if c.running {
+		select {
+		case c.updateCh <- struct{}{}:
+		default:
+		}
+	}
+
 	return nil
 }
 
@@ -369,16 +401,16 @@ func (h vaultDataHeapImp) Swap(i, j int) {
 
 func (h *vaultDataHeapImp) Push(x interface{}) {
 	n := len(*h)
-	data := x.(*vaultClientHeapEntry)
-	data.index = n
-	*h = append(*h, data)
+	entry := x.(*vaultClientHeapEntry)
+	entry.index = n
+	*h = append(*h, entry)
 }
 
 func (h *vaultDataHeapImp) Pop() interface{} {
 	old := *h
 	n := len(old)
-	data := old[n-1]
-	data.index = -1 // for safety
+	entry := old[n-1]
+	entry.index = -1 // for safety
 	*h = old[0 : n-1]
-	return data
+	return entry
 }

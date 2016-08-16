@@ -242,13 +242,27 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 	go c.vaultClient.Start()
 
 	// TODO: Test code begins
-	for i := 0; i < 2; i++ {
-		derivedWrappedToken, err := c.vaultClient.DeriveToken()
+	num := 2
+	var err error
+	tokens := make([]string, num)
+	for i := 0; i < num; i++ {
+		tokens[i], err = c.vaultClient.DeriveToken()
 		if err != nil {
 			log.Printf("vaultclient: failed to derive a vault token: %v", err)
 		}
-		c.vaultClient.RenewToken(derivedWrappedToken)
+		c.vaultClient.RenewToken(tokens[i])
 	}
+
+	/*
+		time.Sleep(10 * time.Second)
+
+		for i := 0; i < num; i++ {
+			if err := c.vaultClient.StopRenewToken(tokens[i]); err != nil {
+				c.logger.Printf("StopRenewToken failed: %v", err)
+			}
+		}
+	*/
+
 	// TODO: Test code ends
 
 	return c, nil
