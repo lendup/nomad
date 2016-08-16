@@ -409,7 +409,7 @@ func (d *DockerDriver) createContainer(ctx *ExecContext, task *structs.Task,
 		LogConfig: docker.LogConfig{
 			Type: "syslog",
 			Config: map[string]string{
-				"syslog-address": syslogAddr,
+				"tag": "{{.Name}}/{{.ID}}",
 			},
 		},
 	}
